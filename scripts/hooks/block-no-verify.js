@@ -21,14 +21,7 @@ let raw = '';
 /**
  * Git commands that support the --no-verify flag.
  */
-const GIT_COMMANDS_WITH_NO_VERIFY = [
-  'commit',
-  'push',
-  'merge',
-  'cherry-pick',
-  'rebase',
-  'am',
-];
+const GIT_COMMANDS_WITH_NO_VERIFY = ['commit', 'push', 'merge', 'cherry-pick', 'rebase', 'am'];
 
 /**
  * Characters that can appear immediately before 'git' in a command string.
@@ -56,21 +49,10 @@ const COMMIT_OPTIONS_WITH_VALUE = new Set([
   '--template',
   '--fixup',
   '--squash',
-  '--pathspec-from-file',
+  '--pathspec-from-file'
 ]);
 
-const COMMIT_OPTIONS_WITH_INLINE_VALUE = [
-  '--message=',
-  '--file=',
-  '--reuse-message=',
-  '--reedit-message=',
-  '--author=',
-  '--date=',
-  '--template=',
-  '--fixup=',
-  '--squash=',
-  '--pathspec-from-file=',
-];
+const COMMIT_OPTIONS_WITH_INLINE_VALUE = ['--message=', '--file=', '--reuse-message=', '--reedit-message=', '--author=', '--date=', '--template=', '--fixup=', '--squash=', '--pathspec-from-file='];
 
 // Short options that take a value. When seen as part of a combined
 // short-option token (e.g. -tn), git's parser treats the rest of the
@@ -100,7 +82,7 @@ function tokenizeShellWords(input, start = 0, end = input.length) {
     tokens.push({
       value,
       start: tokenStart,
-      end: index,
+      end: index
     });
     value = '';
     tokenStart = null;
@@ -239,7 +221,7 @@ function getCommitShortValueOption(value) {
     if (COMMIT_SHORT_OPTIONS_WITH_VALUE.has(options.charAt(i))) {
       return {
         consumesNextValue: i === options.length - 1,
-        containsInlineValue: i < options.length - 1,
+        containsInlineValue: i < options.length - 1
       };
     }
   }
@@ -290,8 +272,26 @@ function isInComment(input, idx) {
  * quoted span whose preceding word is NOT one of these is just string data —
  * e.g. an `echo` message, a heredoc, a JSON test fixture — not a real
  * invocation, and must not be treated as one.
+ *
+ * `exec`, `source`, `.`, and bare `env` are deliberately excluded even though
+ * they can precede a quoted string: `exec` and plain `env` pass the string
+ * straight to execvp as a literal, space-containing program name —
+ * `env 'git commit --no-verify'` looks for a program named that whole
+ * string, it never runs `git`. `source`/`.` treat the string as a filename
+ * to open, not inline code. None of them re-parse the string as shell
+ * syntax, so flagging them here would only reintroduce false positives.
+ * `env` is handled separately below: it only counts when paired with
+ * `-S`/`--split-string`, the one flag that makes it word-split and execute
+ * the string instead — see `isExecutedSpan`.
  */
-const QUOTE_EXEC_COMMANDS = new Set(['eval', 'bash', 'sh', 'zsh', 'ksh', 'dash', 'source', '.', 'exec', 'env']);
+const QUOTE_EXEC_COMMANDS = new Set(['eval', 'bash', 'sh', 'zsh', 'ksh', 'dash']);
+
+/**
+ * Matches env's word-splitting flag, the one case where `env` actually
+ * re-parses its string argument into a command instead of treating it as a
+ * literal program name: `-S`, `--split-string`, or `--split-string=...`.
+ */
+const ENV_SPLIT_STRING_FLAG = /^(-S|--split-string)(=.*)?$/;
 
 /**
  * Find every top-level (non-nested — shell quotes don't nest) quoted span in
@@ -433,6 +433,7 @@ function findSubstitutionRanges(input, start, end) {
  */
 function isExecutedSpan(input, span) {
   let end = span.start;
+  let sawSplitStringFlag = false;
   // No fixed hop cap: `end` strictly decreases every iteration (bounded below
   // by 0), so this always terminates in at most input.length steps. A fixed
   // cap here previously let enough value-taking flags before the quote (e.g.
@@ -449,9 +450,21 @@ function isExecutedSpan(input, span) {
     if (!word) return false;
 
     // Check every word walked over, flag or not — a value-taking flag (e.g.
-    // `bash -O extglob -c '...'`, `env -S '...'`) means the command name can
-    // sit multiple tokens back from the quote, not just past a single flag.
+    // `bash -O extglob -c '...'`) means the command name can sit multiple
+    // tokens back from the quote, not just past a single flag.
     const base = word.split('/').pop().toLowerCase();
+
+    if (ENV_SPLIT_STRING_FLAG.test(word)) sawSplitStringFlag = true;
+
+    if (base === 'env') {
+      // Bare `env 'foo'` passes the whole string to execvp as a literal
+      // program name — it never runs it as shell code. Only `env -S`/
+      // `--split-string` actually word-splits and executes the string, so
+      // that's the only form worth blocking.
+      if (sawSplitStringFlag) return true;
+      return false;
+    }
+
     if (QUOTE_EXEC_COMMANDS.has(base)) return true;
 
     end = start;
@@ -555,10 +568,19 @@ function detectGitCommand(input, start = 0, ignoredSpans = computeIgnoredSpans(i
 
         const before = cmdIdx > 0 ? input[cmdIdx - 1] : ' ';
         const after = input[cmdIdx + cmd.length] || ' ';
-        if (!/\s/.test(before)) { searchPos = cmdIdx + 1; continue; }
-        if (!/[\s;&#|>)\]}"']/.test(after) && after !== '') { searchPos = cmdIdx + 1; continue; }
+        if (!/\s/.test(before)) {
+          searchPos = cmdIdx + 1;
+          continue;
+        }
+        if (!/[\s;&#|>)\]}"']/.test(after) && after !== '') {
+          searchPos = cmdIdx + 1;
+          continue;
+        }
         if (/[;|]/.test(input.slice(git.idx + git.len, cmdIdx))) break;
-        if (isInComment(input, cmdIdx)) { searchPos = cmdIdx + 1; continue; }
+        if (isInComment(input, cmdIdx)) {
+          searchPos = cmdIdx + 1;
+          continue;
+        }
 
         // Verify this token is the first non-flag word after "git" — i.e. the
         // actual subcommand, not an argument value to a different subcommand.
@@ -569,11 +591,13 @@ function detectGitCommand(input, start = 0, ignoredSpans = computeIgnoredSpans(i
         let onlyFlagsAndArgs = true;
         let expectFlagArg = false;
         for (const t of tokens) {
-          if (expectFlagArg) { expectFlagArg = false; continue; }
+          if (expectFlagArg) {
+            expectFlagArg = false;
+            continue;
+          }
           if (t.startsWith('-')) {
             // -c is a git global flag that takes the next token as its argument
-            if (t === '-c' || t === '-C' || t === '--work-tree' || t === '--git-dir' ||
-                t === '--namespace' || t === '--super-prefix') {
+            if (t === '-c' || t === '-C' || t === '--work-tree' || t === '--git-dir' || t === '--namespace' || t === '--super-prefix') {
               expectFlagArg = true;
             }
             continue;
@@ -581,7 +605,10 @@ function detectGitCommand(input, start = 0, ignoredSpans = computeIgnoredSpans(i
           onlyFlagsAndArgs = false;
           break;
         }
-        if (!onlyFlagsAndArgs) { searchPos = cmdIdx + 1; continue; }
+        if (!onlyFlagsAndArgs) {
+          searchPos = cmdIdx + 1;
+          continue;
+        }
 
         if (cmdIdx < bestIdx) {
           bestIdx = cmdIdx;
@@ -597,7 +624,7 @@ function detectGitCommand(input, start = 0, ignoredSpans = computeIgnoredSpans(i
         offset: bestIdx + bestCmd.length,
         gitStart: git.idx,
         gitEnd: git.idx + git.len,
-        commandStart: bestIdx,
+        commandStart: bestIdx
       };
     }
 
@@ -697,14 +724,14 @@ function checkCommand(input) {
     if (hasHooksPathOverride(input, detected)) {
       return {
         blocked: true,
-        reason: `BLOCKED: Overriding core.hooksPath is not allowed with git ${gitCommand}. Git hooks must not be bypassed.`,
+        reason: `BLOCKED: Overriding core.hooksPath is not allowed with git ${gitCommand}. Git hooks must not be bypassed.`
       };
     }
 
     if (hasNoVerifyFlag(input, gitCommand, offset)) {
       return {
         blocked: true,
-        reason: `BLOCKED: --no-verify flag is not allowed with git ${gitCommand}. Git hooks must not be bypassed.`,
+        reason: `BLOCKED: --no-verify flag is not allowed with git ${gitCommand}. Git hooks must not be bypassed.`
       };
     }
 
@@ -750,7 +777,7 @@ function run(rawInput) {
   if (result.blocked) {
     return {
       exitCode: 2,
-      stderr: result.reason,
+      stderr: result.reason
     };
   }
 
