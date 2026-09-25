@@ -550,6 +550,97 @@ if (
   passed++;
 else failed++;
 
+// --- bash/sh/zsh/ksh/dash only re-parse the ONE quoted argument immediately
+// after -c as code; without -c they open the argument as a script filename
+// (like source/.), and a quoted arg after the -c string is just $0/$1/...,
+// not more code. (flagged by CodeRabbit review) ---
+
+if (
+  test('allows a positional arg after bash -c (only the -c string itself is executed)', () => {
+    const r = runHook({ tool_input: { command: "bash -c 'printf ok' 'git commit --no-verify -m test'" } });
+    assert.strictEqual(r.code, 0, `expected exit 0, got ${r.code}: ${r.stderr}`);
+  })
+)
+  passed++;
+else failed++;
+
+if (
+  test('allows bash with no -c (argument is a script filename, never executed inline)', () => {
+    const r = runHook({ tool_input: { command: "bash 'git commit --no-verify -m test'" } });
+    assert.strictEqual(r.code, 0, `expected exit 0, got ${r.code}: ${r.stderr}`);
+  })
+)
+  passed++;
+else failed++;
+
+if (
+  test('allows sh with no -c (argument is a script filename, never executed inline)', () => {
+    const r = runHook({ tool_input: { command: "sh 'git commit --no-verify -m test'" } });
+    assert.strictEqual(r.code, 0, `expected exit 0, got ${r.code}: ${r.stderr}`);
+  })
+)
+  passed++;
+else failed++;
+
+if (
+  test('still blocks bash -c with the real command string (regression)', () => {
+    const r = runHook({ tool_input: { command: "bash -c 'git commit --no-verify -m test'" } });
+    assert.strictEqual(r.code, 2, `expected exit 2, got ${r.code}`);
+  })
+)
+  passed++;
+else failed++;
+
+if (
+  test('still blocks bash -O extglob -c with a positional arg after the real command string', () => {
+    const r = runHook({ tool_input: { command: "bash -O extglob -c 'git commit --no-verify -m test' 'harmless-arg0'" } });
+    assert.strictEqual(r.code, 2, `expected exit 2, got ${r.code}`);
+  })
+)
+  passed++;
+else failed++;
+
+// --- Variable-assignment indirection: `X='git commit --no-verify'; bash -c
+// "$X"` must not sail through just because the literal bypass text sits in
+// an "inert" single-quoted assignment rather than directly in the executed
+// span. (flagged by Greptile review, P1 security) ---
+
+if (
+  test('blocks --no-verify smuggled through a variable assigned then run via bash -c "$VAR"', () => {
+    const r = runHook({ tool_input: { command: 'X=\'git commit --no-verify -m x\'; bash -c "$X"' } });
+    assert.strictEqual(r.code, 2, `expected exit 2, got ${r.code}`);
+  })
+)
+  passed++;
+else failed++;
+
+if (
+  test('blocks --no-verify smuggled through a variable assigned then run via eval "$VAR"', () => {
+    const r = runHook({ tool_input: { command: 'X=\'git commit --no-verify -m x\'; eval "$X"' } });
+    assert.strictEqual(r.code, 2, `expected exit 2, got ${r.code}`);
+  })
+)
+  passed++;
+else failed++;
+
+if (
+  test('allows a variable assignment that is never fed to a re-executing interpreter', () => {
+    const r = runHook({ tool_input: { command: 'MSG=\'discuss --no-verify in standup\'; echo "$MSG"' } });
+    assert.strictEqual(r.code, 0, `expected exit 0, got ${r.code}: ${r.stderr}`);
+  })
+)
+  passed++;
+else failed++;
+
+if (
+  test('allows bash -c "$VAR" when the executed span has no bare variable reference', () => {
+    const r = runHook({ tool_input: { command: "X='git commit --no-verify -m x'; bash -c 'printf safe'" } });
+    assert.strictEqual(r.code, 0, `expected exit 0, got ${r.code}: ${r.stderr}`);
+  })
+)
+  passed++;
+else failed++;
+
 console.log('─'.repeat(50));
 console.log(`Passed: ${passed}  Failed: ${failed}`);
 

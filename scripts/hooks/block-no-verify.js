@@ -283,8 +283,17 @@ function isInComment(input, idx) {
  * `env` is handled separately below: it only counts when paired with
  * `-S`/`--split-string`, the one flag that makes it word-split and execute
  * the string instead — see `isExecutedSpan`.
+ *
+ * `eval` always executes every string argument it's given, no flag needed.
+ * `bash`/`sh`/`zsh`/`ksh`/`dash` are different: given a single quoted
+ * argument with no `-c`, they open it as a script FILENAME — the same
+ * source/. case above — and even with `-c`, only the argument immediately
+ * after `-c` is the executed command string; any further quoted argument is
+ * `$0`, `$1`, ..., not more code. So these two groups need different
+ * adjacency rules in `isExecutedSpan`.
  */
-const QUOTE_EXEC_COMMANDS = new Set(['eval', 'bash', 'sh', 'zsh', 'ksh', 'dash']);
+const EVAL_COMMANDS = new Set(['eval']);
+const SHELL_C_COMMANDS = new Set(['bash', 'sh', 'zsh', 'ksh', 'dash']);
 
 /**
  * Matches env's word-splitting flag, the one case where `env` actually
@@ -292,6 +301,15 @@ const QUOTE_EXEC_COMMANDS = new Set(['eval', 'bash', 'sh', 'zsh', 'ksh', 'dash']
  * literal program name: `-S`, `--split-string`, or `--split-string=...`.
  */
 const ENV_SPLIT_STRING_FLAG = /^(-S|--split-string)(=.*)?$/;
+
+/**
+ * Matches a `-c` short-option cluster (`-c`, `-lc`, ...). Bash's own rule is
+ * that `-c`'s value must be the token immediately following it, so this is
+ * only meaningful when tested against the very first word walked in
+ * `isExecutedSpan` — a later positional quote is preceded by the previous
+ * quote's tail fragment, not `-c`, so it never matches this at that point.
+ */
+const DASH_C_FLAG = /^-[A-Za-z]*c$/;
 
 /**
  * Find every top-level (non-nested — shell quotes don't nest) quoted span in
@@ -434,6 +452,8 @@ function findSubstitutionRanges(input, start, end) {
 function isExecutedSpan(input, span) {
   let end = span.start;
   let sawSplitStringFlag = false;
+  let precededByDashC = false;
+  let isFirstWord = true;
   // No fixed hop cap: `end` strictly decreases every iteration (bounded below
   // by 0), so this always terminates in at most input.length steps. A fixed
   // cap here previously let enough value-taking flags before the quote (e.g.
@@ -454,6 +474,11 @@ function isExecutedSpan(input, span) {
     // tokens back from the quote, not just past a single flag.
     const base = word.split('/').pop().toLowerCase();
 
+    if (isFirstWord) {
+      precededByDashC = DASH_C_FLAG.test(word);
+      isFirstWord = false;
+    }
+
     if (ENV_SPLIT_STRING_FLAG.test(word)) sawSplitStringFlag = true;
 
     if (base === 'env') {
@@ -465,11 +490,34 @@ function isExecutedSpan(input, span) {
       return false;
     }
 
-    if (QUOTE_EXEC_COMMANDS.has(base)) return true;
+    if (EVAL_COMMANDS.has(base)) return true;
+
+    if (SHELL_C_COMMANDS.has(base)) {
+      // Without `-c`, these open the quoted argument as a script FILENAME
+      // (like source/.), not inline code. With `-c`, only the argument
+      // directly after it is the command string — `precededByDashC` is only
+      // true when THIS quote was that argument, not some later one.
+      return precededByDashC;
+    }
 
     end = start;
   }
 }
+
+/**
+ * A bare variable reference (`$NAME` or `${NAME}`) inside a span that IS
+ * executed code means the real bytes that will run are not fully known from
+ * this command string alone — they depend on whatever that variable holds
+ * at run time. `bash -c "$X"` / `eval "$X"` are exactly this shape.
+ */
+const VAR_REFERENCE = /\$\{?[A-Za-z_][A-Za-z0-9_]*\}?/;
+
+/**
+ * Whether the text immediately before a quote's opening character ends in a
+ * shell variable assignment (`NAME=`), i.e. the quote is that variable's
+ * value rather than a command argument.
+ */
+const VAR_ASSIGNMENT_BEFORE_QUOTE = /(?:^|[;&|(\n]|\s)[A-Za-z_][A-Za-z0-9_]*=$/;
 
 /**
  * Quoted ranges whose content is inert string data rather than something the
@@ -480,12 +528,30 @@ function isExecutedSpan(input, span) {
  * substitution they contain regardless of what command they're an argument
  * to, so those sub-ranges are carved out and left un-ignored even when the
  * enclosing quote itself is inert.
+ *
+ * One more case: if some executed span elsewhere re-executes a bare
+ * variable reference (`bash -c "$X"`), the interpreter's real input is
+ * whatever that variable holds — which this scanner cannot resolve
+ * statically. Trusting a same-command assignment's quoted value as inert
+ * here would let `X='git commit --no-verify'; bash -c "$X"` sail through
+ * untouched. So once that pattern shows up anywhere in the command,
+ * assignment values stop being treated as inert too — a conservative,
+ * name-agnostic rule: it doesn't try to prove the assignment feeds that
+ * specific variable, it just stops trusting any local assignment once
+ * variable-driven re-execution is present at all.
  */
 function computeIgnoredSpans(input) {
+  const spans = computeQuoteSpans(input);
+  const executed = spans.map(span => isExecutedSpan(input, span));
+  const hasVariableDrivenExecution = spans.some((span, i) => executed[i] && VAR_REFERENCE.test(input.slice(span.start, span.end)));
+
   const ignored = [];
 
-  for (const span of computeQuoteSpans(input)) {
-    if (isExecutedSpan(input, span)) continue;
+  for (let i = 0; i < spans.length; i++) {
+    const span = spans[i];
+    if (executed[i]) continue;
+
+    if (hasVariableDrivenExecution && VAR_ASSIGNMENT_BEFORE_QUOTE.test(input.slice(0, span.start))) continue;
 
     if (span.quote === "'") {
       ignored.push({ start: span.start, end: span.end });
